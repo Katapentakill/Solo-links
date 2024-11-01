@@ -1,0 +1,136 @@
+# HOLA ESTE CODIGO LO COMPARTO DE ESTA MANERA, PORQUE AUN ESTOY EN COMPETENCIA, ESTA ES UNA PARTE DEL CODIGO DONDE SE HACE UN ENTRENAMIENTO ITERATIVO CON DESLIZAMIENTO CON UN LEARNING RATE BAJO
+
+import pandas as pd
+import xgboost as xgb
+import numpy as np
+import os
+
+# Parámetros iniciales
+TARGET = 'responder_6'
+FEAT_COLS = [f"feature_{i:02d}" for i in range(79)]
+partition_count = 10  # Número de particiones de archivos
+increment_step = 25  # Avance del time_id para el próximo entrenamiento
+train_size = 400  # Número de time_id para entrenar antes de evaluar
+validation_step = 5  # Cada 50 date_id se hará una validación
+
+# Parámetro para especificar el date_id inicial
+start_date_id = 0  # Cambia este valor al date_id que desees
+
+# Configuración del modelo XGBoost
+params = {
+    'objective': 'reg:squarederror',
+    'learning_rate': 0.00005,
+    'max_depth': 7,
+    'min_child_weight': 1,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'alpha': 0.5,
+    'lambda': 0.5,
+}
+
+# Función para calcular la métrica personalizada
+def custom_metric(y_true, y_pred, weight):
+    weighted_r2 = 1 - (np.sum(weight * (y_true - y_pred) ** 2) / np.sum(weight * y_true ** 2))
+    return 'weighted_r2', weighted_r2
+
+# Carga de datos de validación
+validation_data = pd.read_parquet('/kaggle/input/jane-street-real-time-market-data-forecasting/lags.parquet/date_id=0/part-0.parquet').fillna(0)
+
+# Bucle para procesar cada archivo de partición
+for i in range(partition_count):
+    file_path = f'/kaggle/input/jane-street-real-time-market-data-forecasting/train.parquet/partition_id={i}/part-0.parquet'
+    data = pd.read_parquet(file_path).fillna(0)  # Carga y rellena NaNs con 0
+
+    # Listas para almacenar métricas promediadas cada 50 date_id
+    overall_rmse_list = []
+    overall_weighted_r2_list = []
+
+    # Filtra las filas relevantes de acuerdo a la date_id
+    for date_id in data['date_id'].unique():
+        # Solo procesar si el date_id es mayor o igual que el especificado
+        if date_id < start_date_id:
+            continue
+
+        date_data = data[data['date_id'] == date_id]
+
+        # Inicializa el modelo si existe uno guardado
+        model_path = 'model_final_date.json' if date_id > 0 else None
+        model = None
+        
+        # Si existe un modelo, cargarlo
+        if model_path and os.path.exists(model_path):
+            model = xgb.Booster({'nthread': 4})
+            model.load_model(model_path)
+
+        # Listas para almacenar resultados de validación
+        rmse_list = []
+        weighted_r2_list = []
+
+        # Ciclo para entrenar y evaluar cada 20 time_id y avanzar 10
+        max_time_id = date_data['time_id'].max()
+        for start_time_id in range(0, max_time_id - train_size, increment_step):
+            
+            # Inicializa el modelo si existe uno guardado
+            model_path = 'model_final_date.json'
+            if model_path and os.path.exists(model_path):
+                model = xgb.Booster({'nthread': 4})
+                model.load_model(model_path)
+
+            train_data = date_data[(date_data['time_id'] >= start_time_id) &
+                                   (date_data['time_id'] < start_time_id + train_size)]
+            eval_time_id = start_time_id + train_size
+            eval_data = date_data[date_data['time_id'] == eval_time_id]
+
+            # Asegúrate de que eval_data no esté vacío
+            if eval_data.empty or train_data.empty:
+                continue
+
+            # Convertimos a DMatrix para XGBoost
+            dtrain = xgb.DMatrix(train_data[FEAT_COLS], label=train_data[TARGET], weight=train_data['weight'])
+            dval = xgb.DMatrix(eval_data[FEAT_COLS], label=eval_data[TARGET], weight=eval_data['weight'])
+
+            # Entrenamiento del modelo
+            model = xgb.train(params, dtrain, xgb_model=model, evals=[(dval, 'eval')],
+                              evals_result={'eval': {}},
+                              verbose_eval=False,
+                              early_stopping_rounds=15)
+
+            # Almacenar el RMSE y el weighted R²
+            rmse = model.best_score
+            rmse_list.append(rmse)
+
+            y_pred = model.predict(dval)
+            weighted_r2 = custom_metric(eval_data[TARGET].values, y_pred, eval_data['weight'].values)[1]
+            weighted_r2_list.append(weighted_r2)
+
+            # Guardar modelo después de cada evaluación
+            model.save_model('model_final_date.json')
+
+        # Acumular los resultados de validación para este date_id
+        if rmse_list and weighted_r2_list:
+            average_rmse = np.average(rmse_list)
+            average_weighted_r2 = np.average(weighted_r2_list, weights=[eval_data['weight'].sum() for _ in weighted_r2_list])
+            overall_rmse_list.append(average_rmse)
+            overall_weighted_r2_list.append(average_weighted_r2)
+
+        # Validación cada 50 date_id
+        if date_id % validation_step == 0:
+            # Utiliza los datos de validación cargados
+            val_y_true = validation_data[validation_data['date_id'] == date_id][TARGET].values
+            val_weight = validation_data[validation_data['date_id'] == date_id]['weight'].values
+            
+            # Asegúrate de que los datos de validación no estén vacíos
+            if len(val_y_true) > 0:
+                dval_validation = xgb.DMatrix(validation_data[FEAT_COLS], label=val_y_true, weight=val_weight)
+                y_pred_val = model.predict(dval_validation)
+                weighted_r2_val = custom_metric(val_y_true, y_pred_val, val_weight)[1]
+                overall_rmse = np.mean(overall_rmse_list)
+                overall_weighted_r2 = np.mean(overall_weighted_r2_list)
+
+                print(f"Validation at Date ID {date_id} - Overall Average RMSE: {overall_rmse:.4f}, Overall Average Weighted R²: {overall_weighted_r2:.4f}, Validation Weighted R²: {weighted_r2_val:.4f}")
+
+                overall_rmse_list.clear()
+                overall_weighted_r2_list.clear()
+
+        # Guardar el modelo final antes de pasar al siguiente
+        model.save_model('model_final_date.json')
